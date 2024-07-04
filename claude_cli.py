@@ -29,13 +29,19 @@ def add_file_to_store(filepath):
 
 def retrieve_relevant_context(query, top_k=3):
     """Find the most relevant context from the vector store for a given query."""
+    if not vector_store:
+        print("Vector store is empty. Make sure to index documents first.")
+        return ""
+    
     query_embedding = embed_text(query)
     similarities = {path: cosine_similarity([query_embedding], [emb])[0][0] for path, emb in vector_store.items()}
     sorted_paths = sorted(similarities.items(), key=lambda x: x[1], reverse=True)[:top_k]
+    
     context = ""
-    for path, _ in sorted_paths:
+    for path, similarity in sorted_paths:
         with open(path, 'r') as file:
-            context += f"\nContent from {path}:\n{file.read()}\n"
+            content = file.read()
+            context += f"\nContent from {path} (similarity: {similarity:.2f}):\n{content}\n"
     return context
 
 def load_config():
@@ -53,23 +59,23 @@ def save_config(config):
         json.dump(config, f, indent=2)
 
 def format_response(response, width=80):
-    """Format the response with word wrapping."""
+    """Format the response while preserving markdown."""
     if isinstance(response, str):
-        return textwrap.fill(response, width=width)
-    elif isinstance(response, dict):
-        return json.dumps(response, indent=2)
+        lines = response.split('\n')
+        wrapped_lines = [textwrap.fill(line, width=width) if not line.startswith('```') else line for line in lines]
+        return '\n'.join(wrapped_lines)
     elif isinstance(response, list):
-        return "\n".join(textwrap.fill(str(item), width=width) for item in response)
+        formatted = ""
+        for block in response:
+            if hasattr(block, 'text'):
+                lines = block.text.split('\n')
+                wrapped_lines = [textwrap.fill(line, width=width) if not line.startswith('```') else line for line in lines]
+                formatted += '\n'.join(wrapped_lines) + "\n\n"
+            else:
+                formatted += str(block) + "\n\n"
+        return formatted.strip()
     else:
-        return str(response)
-
-class CustomJSONEncoder(json.JSONEncoder):
-    """Custom JSON Encoder to handle non-serializable objects."""
-    def default(self, obj):
-        try:
-            return json.JSONEncoder.default(self, obj)
-        except TypeError:
-            return str(obj)
+        return textwrap.fill(str(response), width=width)
 
 def chat_with_claude(prompt, role=None, temperature=0.7, max_tokens=None, context="", stream=False):
     """Send a prompt to Claude and return the response, with optional streaming."""
@@ -85,12 +91,14 @@ def chat_with_claude(prompt, role=None, temperature=0.7, max_tokens=None, contex
     full_prompt = f"""As an AI assistant, please consider the following context and user query:
 Context:
 {context}
+
 User query: {prompt}
-Please provide a response that addresses the user's query, taking into account the provided context and your knowledge."""
+
+Please provide a response that addresses the user's query, taking into account the provided context and your knowledge. Use markdown formatting in your response."""
 
     message_params = {
-        "model": "claude-3-5-sonnet-20240620",  # Updated to the newest model
-        "max_tokens": max_tokens if max_tokens is not None else 1000,  # Default to 1000 if not provided
+        "model": "claude-3-5-sonnet-20240620",
+        "max_tokens": max_tokens if max_tokens is not None else 1000,
         "temperature": temperature,
         "system": system_prompt,
         "messages": [{"role": "user", "content": full_prompt}]
@@ -107,10 +115,10 @@ Please provide a response that addresses the user's query, taking into account t
             return full_response
         else:
             message = client.messages.create(**message_params)
-            return message.content  # Return the content of the message
+            return message.content
     except anthropic.APIError as e:
         print(f"An error occurred while communicating with the Claude API: {e}")
-        return None
+        return str(e)
 
 def save_to_markdown(prompt, response, filename=None):
     """Save the prompt and response to a markdown file."""
@@ -128,10 +136,10 @@ def save_last_interaction(prompt, response):
     last_interaction = {
         'timestamp': datetime.now().isoformat(),
         'prompt': prompt,
-        'response': response
+        'response': str(response)  # Convert response to string to ensure JSON serialization
     }
     with open(os.path.expanduser('~/.claude_last_interaction.json'), 'w') as f:
-        json.dump(last_interaction, f, indent=2, cls=CustomJSONEncoder)
+        json.dump(last_interaction, f, indent=2)
 
 def load_last_interaction():
     """Load the last interaction from the JSON file."""
@@ -191,7 +199,7 @@ def main():
         if roles:
             print("Saved role configurations:")
             for name, details in roles.items():
-                print(f" {name}: {details}")
+                print(f"  {name}: {details}")
         else:
             print("No saved role configurations.")
         return
@@ -212,7 +220,7 @@ def main():
             args.max_tokens = role_config.get('max_tokens', args.max_tokens)
         else:
             print(f"No saved configuration found for role: {args.use_role}")
-        return
+            return
 
     if not args.prompt:
         prompt = input("Enter your prompt: ")
@@ -220,6 +228,7 @@ def main():
         prompt = " ".join(args.prompt)
 
     context = retrieve_relevant_context(prompt) if vector_store else ""
+    print(f"Retrieved context:\n{context}\n")
 
     # Provide default values and ensure correct types
     max_tokens = int(args.max_tokens) if args.max_tokens is not None else 1000
@@ -233,7 +242,7 @@ def main():
             print(formatted_response)
         save_last_interaction(prompt, response)
         if args.save:
-            save_to_markdown(prompt, formatted_response, args.save if isinstance(args.save, str) else None)
+            save_to_markdown(prompt, response, args.save if isinstance(args.save, str) else None)
     else:
         print("Failed to get a response from Claude.")
 
