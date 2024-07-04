@@ -56,10 +56,20 @@ def format_response(response, width=80):
     """Format the response with word wrapping."""
     if isinstance(response, str):
         return textwrap.fill(response, width=width)
+    elif isinstance(response, dict):
+        return json.dumps(response, indent=2)
     elif isinstance(response, list):
-        return "\n".join(textwrap.fill(item, width=width) for item in response if isinstance(item, str))
+        return "\n".join(textwrap.fill(str(item), width=width) for item in response)
     else:
         return str(response)
+
+class CustomJSONEncoder(json.JSONEncoder):
+    """Custom JSON Encoder to handle non-serializable objects."""
+    def default(self, obj):
+        try:
+            return json.JSONEncoder.default(self, obj)
+        except TypeError:
+            return str(obj)
 
 def chat_with_claude(prompt, role=None, temperature=0.7, max_tokens=None, context="", stream=False):
     """Send a prompt to Claude and return the response, with optional streaming."""
@@ -121,7 +131,7 @@ def save_last_interaction(prompt, response):
         'response': response
     }
     with open(os.path.expanduser('~/.claude_last_interaction.json'), 'w') as f:
-        json.dump(last_interaction, f, indent=2)
+        json.dump(last_interaction, f, indent=2, cls=CustomJSONEncoder)
 
 def load_last_interaction():
     """Load the last interaction from the JSON file."""
@@ -219,16 +229,13 @@ def main():
 
     if response:
         if not args.stream:
-            if isinstance(response, str):
-                print(format_response(response, args.width))
-            else:
-                print("Unexpected response format. Unable to format.")
+            formatted_response = format_response(response, args.width)
+            print(formatted_response)
         save_last_interaction(prompt, response)
         if args.save:
-            save_to_markdown(prompt, response, args.save if isinstance(args.save, str) else None)
+            save_to_markdown(prompt, formatted_response, args.save if isinstance(args.save, str) else None)
     else:
         print("Failed to get a response from Claude.")
 
 if __name__ == "__main__":
     main()
-
