@@ -26,12 +26,16 @@ def add_file_to_store(filepath):
     with open(filepath, 'r') as file:
         content = file.read()
     vector_store[filepath] = embed_text(content)
+    print(f"Indexed file: {filepath}")
+    print(f"Content preview: {content[:100]}...")
 
 def retrieve_relevant_context(query, top_k=3):
     """Find the most relevant context from the vector store for a given query."""
     if not vector_store:
         print("Vector store is empty. Make sure to index documents first.")
         return ""
+    
+    print(f"Vector store contains {len(vector_store)} documents.")
     
     query_embedding = embed_text(query)
     similarities = {path: cosine_similarity([query_embedding], [emb])[0][0] for path, emb in vector_store.items()}
@@ -42,6 +46,8 @@ def retrieve_relevant_context(query, top_k=3):
         with open(path, 'r') as file:
             content = file.read()
             context += f"\nContent from {path} (similarity: {similarity:.2f}):\n{content}\n"
+    
+    print(f"Retrieved context from {len(sorted_paths)} documents.")
     return context
 
 def load_config():
@@ -60,22 +66,23 @@ def save_config(config):
 
 def format_response(response, width=80):
     """Format the response while preserving markdown."""
-    if isinstance(response, str):
-        lines = response.split('\n')
-        wrapped_lines = [textwrap.fill(line, width=width) if not line.startswith('```') else line for line in lines]
-        return '\n'.join(wrapped_lines)
-    elif isinstance(response, list):
-        formatted = ""
-        for block in response:
-            if hasattr(block, 'text'):
-                lines = block.text.split('\n')
-                wrapped_lines = [textwrap.fill(line, width=width) if not line.startswith('```') else line for line in lines]
-                formatted += '\n'.join(wrapped_lines) + "\n\n"
-            else:
-                formatted += str(block) + "\n\n"
-        return formatted.strip()
-    else:
-        return textwrap.fill(str(response), width=width)
+    if isinstance(response, list) and len(response) > 0 and hasattr(response[0], 'text'):
+        response = response[0].text
+    elif not isinstance(response, str):
+        response = str(response)
+    
+    lines = response.split('\n')
+    formatted_lines = []
+    code_block = False
+    for line in lines:
+        if line.strip().startswith('```'):
+            code_block = not code_block
+            formatted_lines.append(line)
+        elif code_block or line.strip().startswith('#') or line.strip().startswith('-') or line.strip().startswith('*'):
+            formatted_lines.append(line)
+        else:
+            formatted_lines.append(textwrap.fill(line, width=width))
+    return '\n'.join(formatted_lines)
 
 def chat_with_claude(prompt, role=None, temperature=0.7, max_tokens=None, context="", stream=False):
     """Send a prompt to Claude and return the response, with optional streaming."""
@@ -89,19 +96,22 @@ def chat_with_claude(prompt, role=None, temperature=0.7, max_tokens=None, contex
         system_prompt += f" You are acting as the assistant to a {role}."
 
     full_prompt = f"""As an AI assistant, please consider the following context and user query:
+
 Context:
 {context}
 
 User query: {prompt}
 
-Please provide a response that addresses the user's query, taking into account the provided context and your knowledge. Use markdown formatting in your response."""
+Please provide a response that addresses the user's query, taking into account the provided context and your knowledge. Make sure to use the information from the context in your response if it's relevant. Use markdown formatting in your response."""
 
     message_params = {
         "model": "claude-3-5-sonnet-20240620",
         "max_tokens": max_tokens if max_tokens is not None else 1000,
         "temperature": temperature,
         "system": system_prompt,
-        "messages": [{"role": "user", "content": full_prompt}]
+        "messages": [
+            {"role": "user", "content": full_prompt}
+        ]
     }
 
     try:
@@ -125,21 +135,37 @@ def save_to_markdown(prompt, response, filename=None):
     if not filename:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"claude_response_{timestamp}.md"
+    
+    formatted_response = format_response(response)
+    
     with open(filename, 'w') as f:
         f.write(f"# Claude Response\n\n")
         f.write(f"## Prompt\n\n{prompt}\n\n")
-        f.write(f"## Response\n\n{response}\n")
+        f.write(f"## Response\n\n{formatted_response}\n")
     print(f"Response saved to {filename}")
 
-def save_last_interaction(prompt, response):
-    """Save the last interaction to a JSON file."""
-    last_interaction = {
-        'timestamp': datetime.now().isoformat(),
-        'prompt': prompt,
-        'response': str(response)  # Convert response to string to ensure JSON serialization
-    }
-    with open(os.path.expanduser('~/.claude_last_interaction.json'), 'w') as f:
-        json.dump(last_interaction, f, indent=2)
+def save_last_interaction(prompt, response, filename=None):
+    """Save the last interaction to a JSON or markdown file."""
+    if filename:
+        if filename.endswith('.json'):
+            last_interaction = {
+                'timestamp': datetime.now().isoformat(),
+                'prompt': prompt,
+                'response': response if isinstance(response, str) else response[0].text if isinstance(response, list) and len(response) > 0 else str(response)
+            }
+            with open(filename, 'w') as f:
+                json.dump(last_interaction, f, indent=2)
+        else:
+            save_to_markdown(prompt, response, filename)
+    else:
+        last_interaction = {
+            'timestamp': datetime.now().isoformat(),
+            'prompt': prompt,
+            'response': response if isinstance(response, str) else response[0].text if isinstance(response, list) and len(response) > 0 else str(response)
+        }
+        with open(os.path.expanduser('~/.claude_last_interaction.json'), 'w') as f:
+            json.dump(last_interaction, f, indent=2)
+    print(f"Last interaction saved to {filename if filename else '~/.claude_last_interaction.json'}")
 
 def load_last_interaction():
     """Load the last interaction from the JSON file."""
@@ -162,7 +188,7 @@ def main():
     parser.add_argument("--save-role", help="Save a role configuration for future use")
     parser.add_argument("--use-role", help="Use a saved role configuration")
     parser.add_argument("--list-roles", action="store_true", help="List all saved role configurations")
-    parser.add_argument("--save-last", action="store_true", help="Save the last interaction to a markdown file")
+    parser.add_argument("--save-last", nargs='?', const=True, help="Save the last interaction to a file. Optionally specify a filename.")
     parser.add_argument("--set-context-path", help="Set the path for context documents")
     parser.add_argument("--index", action="store_true", help="Index local files before querying")
     parser.add_argument("--stream", action="store_true", help="Stream Claude's response in real-time")
@@ -178,6 +204,7 @@ def main():
     if args.index:
         context_path = os.path.expanduser(config['context_path'])
         os.makedirs(context_path, exist_ok=True)  # Create the directory if it doesn't exist
+        vector_store.clear()  # Clear the vector store before indexing
         for filepath in glob.glob(os.path.join(context_path, '*')):
             add_file_to_store(filepath)
         print(f"Indexed local files from: {context_path}")
@@ -207,7 +234,7 @@ def main():
     if args.save_last:
         last_interaction = load_last_interaction()
         if last_interaction:
-            save_to_markdown(last_interaction['prompt'], last_interaction['response'])
+            save_last_interaction(last_interaction['prompt'], last_interaction['response'], args.save_last if isinstance(args.save_last, str) else None)
         else:
             print("No previous interaction found.")
         return
