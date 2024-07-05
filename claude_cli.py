@@ -7,19 +7,16 @@ from datetime import datetime
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import glob
-import textwrap
-import sys
 import pickle
+import sys
 
-model = SentenceTransformer('all-MiniLM-L6-v2')
-vector_store = {}
-
+MODEL = SentenceTransformer('all-MiniLM-L6-v2')
 CONFIG_PATH = os.path.expanduser('~/.claude_cli_config.json')
 VECTOR_STORE_PATH = os.path.expanduser('~/.claude_vector_store.pkl')
-LAST_INTERACTION_PATH = os.path.expanduser('~/.claude_last_interaction.json')
+CONTEXT_HISTORY_PATH = os.path.expanduser('~/.claude_context_history.json')
 
 def embed_text(text):
-    return model.encode([text])[0]
+    return MODEL.encode([text])[0]
 
 def load_vector_store():
     if os.path.exists(VECTOR_STORE_PATH):
@@ -31,16 +28,36 @@ def save_vector_store(vector_store):
     with open(VECTOR_STORE_PATH, 'wb') as f:
         pickle.dump(vector_store, f)
 
-def add_file_to_store(filepath):
+def load_config():
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, 'r') as f:
+            return json.load(f)
+    return {'context_path': os.path.expanduser('~/claude_data'), 'roles': {}}
+
+def save_config(config):
+    with open(CONFIG_PATH, 'w') as f:
+        json.dump(config, f, indent=2)
+
+def load_context_history():
+    if os.path.exists(CONTEXT_HISTORY_PATH):
+        with open(CONTEXT_HISTORY_PATH, 'r') as f:
+            return json.load(f)
+    return []
+
+def save_context_history(history):
+    with open(CONTEXT_HISTORY_PATH, 'w') as f:
+        json.dump(history, f, indent=2)
+
+def add_file_to_store(filepath, vector_store):
     try:
         with open(filepath, 'r') as file:
             content = file.read()
         vector_store[filepath] = embed_text(content)
         print(f"Indexed: {filepath}")
-    except FileNotFoundError:
-        print(f"Error: File not found: {filepath}")
+    except Exception as e:
+        print(f"Error indexing {filepath}: {str(e)}")
 
-def retrieve_relevant_context(query, top_k=3):
+def retrieve_relevant_context(query, vector_store, top_k=3):
     if not vector_store:
         print("Error: Vector store is empty. Please run --index first.")
         return []
@@ -55,29 +72,7 @@ def retrieve_relevant_context(query, top_k=3):
     print(f"Retrieved {len(relevant_documents)} relevant documents.")
     return relevant_documents
 
-def load_config():
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, 'r') as f:
-            return json.load(f)
-    return {'context_path': os.path.expanduser('~/scripts/claude_data'), 'roles': {}}
-
-def save_config(config):
-    with open(CONFIG_PATH, 'w') as f:
-        json.dump(config, f, indent=2)
-
-def format_response(response, width=80):
-    if isinstance(response, str):
-        return textwrap.fill(response, width=width)
-    elif isinstance(response, list) and len(response) > 0 and hasattr(response[0], 'text'):
-        formatted = ""
-        for block in response:
-            if block.type == 'text':
-                formatted += f"{block.text}\n\n"
-        return formatted.strip()
-    else:
-        return textwrap.fill(str(response), width=width)
-
-def chat_with_claude(prompt, role=None, temperature=0.7, max_tokens=None, context_documents=[], stream=False):
+def chat_with_claude(prompt, context_history, role=None, temperature=0.7, max_tokens=None):
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY environment variable is not set")
@@ -87,99 +82,53 @@ def chat_with_claude(prompt, role=None, temperature=0.7, max_tokens=None, contex
     if role:
         system_prompt += f" You are acting as the assistant to a {role}."
 
-    context = "\n".join(f"Content from {path}:\n{preview}" for path, preview in context_documents)
-    full_prompt = f"""As an AI assistant, please consider the following context and user query:
-Context:
-{context}
-
-User query: {prompt}
-
-If the context does not seem relevant, please acknowledge that and provide a response based on your knowledge.
-Please provide a response that addresses the user's query, taking into account the provided context and your knowledge. Use markdown formatting in your response."""
-
-    message_params = {
-        "model": "claude-3-5-sonnet-20240620",
-        "max_tokens": max_tokens if max_tokens is not None else 1000,
-        "temperature": temperature,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": full_prompt}]
-    }
+    messages = [{"role": "user", "content": prompt}]
 
     try:
-        if stream:
+        with client.messages.stream(
+            model="claude-3-5-sonnet-20240620",
+            # model="claude-3-sonnet-20240229",
+            max_tokens=max_tokens or 1000,
+            temperature=temperature,
+            system=system_prompt,
+            messages=messages
+        ) as stream:
             full_response = ""
-            with client.messages.stream(**message_params) as stream:
-                for text in stream.text_stream:
-                    print(text, end="", flush=True)
-                    full_response += text
-                print()
-            return full_response
-        else:
-            message = client.messages.create(**message_params)
-            return message.content
+            for text in stream.text_stream:
+                print(text, end="", flush=True)
+                full_response += text
+            print()
+        return full_response
     except anthropic.APIError as e:
         print(f"An error occurred while communicating with the Claude API: {e}")
         return str(e)
 
-def save_to_markdown(prompt, response, filename=None):
-    if not filename:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"claude_response_{timestamp}.md"
-    formatted_response = format_response(response)
-    with open(filename, 'w') as f:
-        f.write(f"# Claude Response\n\n")
-        f.write(f"## Prompt\n\n{prompt}\n\n")
-        f.write(f"## Response\n\n{formatted_response}\n")
-    print(f"Response saved to {filename}")
-
-def save_last_interaction(prompt, response, filename=None):
-    if filename:
-        if filename.endswith('.json'):
-            last_interaction = {'timestamp': datetime.now().isoformat(), 'prompt': prompt, 'response': response if isinstance(response, str) else response[0].text if isinstance(response, list) and len(response) > 0 else str(response)}
-            with open(filename, 'w') as f:
-                json.dump(last_interaction, f, indent=2)
-        else:
-            save_to_markdown(prompt, response, filename)
-    else:
-        last_interaction = {'timestamp': datetime.now().isoformat(), 'prompt': prompt, 'response': response if isinstance(response, str) else response[0].text if isinstance(response, list) and len(response) > 0 else str(response)}
-        with open(LAST_INTERACTION_PATH, 'w') as f:
-            json.dump(last_interaction, f, indent=2)
-    print(f"Last interaction saved to {filename if filename else LAST_INTERACTION_PATH}")
-
-def load_last_interaction():
-    try:
-        with open(LAST_INTERACTION_PATH, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return None
-
 def main():
-    global vector_store
     vector_store = load_vector_store()
     config = load_config()
+    context_history = load_context_history()
 
     parser = argparse.ArgumentParser(description="Chat with Claude from the command line.")
     parser.add_argument("prompt", nargs="*", help="The prompt to send to Claude")
-    parser.add_argument("--role", help="Set a specific role for Claude (e.g., 'full-stack developer at a cutting-edge startup')")
-    parser.add_argument("--temp", type=float, help="Set the temperature for Claude's responses")
+    parser.add_argument("--role", help="Set a specific role for Claude")
+    parser.add_argument("--temp", type=float, default=0.7, help="Set the temperature for Claude's responses")
     parser.add_argument("--max-tokens", type=int, help="Set the maximum number of tokens for Claude's response")
-    parser.add_argument("--save", nargs='?', const=True, help="Save the response to a markdown file. Optionally specify a filename.")
-    parser.add_argument("--save-role", help="Save a role configuration for future use")
-    parser.add_argument("--use-role", help="Use a saved role configuration")
-    parser.add_argument("--list-roles", action="store_true", help="List all saved role configurations")
-    parser.add_argument("--save-last", nargs='?', const=True, help="Save the last interaction to a file. Optionally specify a filename.")
     parser.add_argument("--set-context-path", help="Set the path for context documents")
     parser.add_argument("--index", action="store_true", help="Index local files before querying")
-    parser.add_argument("--stream", action="store_true", help="Stream Claude's response in real-time")
-    parser.add_argument("--width", type=int, default=80, help="Set the width for response formatting")
     parser.add_argument("--clear-index", action="store_true", help="Clear the indexed documents")
-    parser.add_argument("--query", help="Query to retrieve context for and send to Claude.")
+    parser.add_argument("--clear-history", action="store_true", help="Clear the conversation history")
     args = parser.parse_args()
 
     if args.clear_index:
         vector_store.clear()
         save_vector_store(vector_store)
         print("Cleared indexed documents.")
+        return
+
+    if args.clear_history:
+        context_history.clear()
+        save_context_history(context_history)
+        print("Cleared conversation history.")
         return
 
     if args.set_context_path:
@@ -192,72 +141,20 @@ def main():
         context_path = os.path.expanduser(config['context_path'])
         os.makedirs(context_path, exist_ok=True) 
         for filepath in glob.glob(os.path.join(context_path, '*')):
-            add_file_to_store(filepath)
+            add_file_to_store(filepath, vector_store)
         save_vector_store(vector_store)
         print(f"Indexed files from: {context_path}")
         return
 
-    if args.save_role:
-        config['roles'] = config.get('roles', {})
-        config['roles'][args.save_role] = {
-            'role': args.role,
-            'temperature': args.temp,
-            'max_tokens': args.max_tokens
-        }
-        save_config(config)
-        print(f"Saved role configuration: {args.save_role}")
-        return
-
-    if args.list_roles:
-        roles = config.get('roles', {})
-        if roles:
-            print("Saved role configurations:")
-            for name, details in roles.items():
-                print(f" {name}: {details}")
-        else:
-            print("No saved role configurations.")
-        return
-
-    if args.save_last:
-        last_interaction = load_last_interaction()
-        if last_interaction:
-            save_last_interaction(last_interaction['prompt'], last_interaction['response'], args.save_last if isinstance(args.save_last, str) else None)
-        else:
-            print("No previous interaction found.")
-        return
-
-    if args.use_role:
-        role_config = config.get('roles', {}).get(args.use_role)
-        if role_config:
-            args.role = role_config.get('role', args.role)
-            args.temp = float(role_config.get('temperature', args.temp)) if role_config.get('temperature') is not None else None
-            args.max_tokens = role_config.get('max_tokens', args.max_tokens)
-        else:
-            print(f"No saved configuration found for role: {args.use_role}")
-            return
-
-    prompt = args.query if args.query else " ".join(args.prompt) if args.prompt else input("Enter your prompt: ")
+    prompt = " ".join(args.prompt) if args.prompt else input("Enter your prompt: ")
+    relevant_docs = retrieve_relevant_context(prompt, vector_store)
+    context = "\n\n".join([f"Content from {path}:\n{content}" for path, content in relevant_docs])
+    full_prompt = f"Consider the following context:\n\n{context}\n\nNow, please respond to this query: {prompt}"
     
-    if prompt:
-        context_documents = retrieve_relevant_context(prompt)
-        if not context_documents:
-            print("Warning: No relevant context found. Responding without context.")
-
-        max_tokens = int(args.max_tokens) if args.max_tokens is not None else 1000
-        temperature = float(args.temp) if args.temp is not None else 0.7
-
-        response = chat_with_claude(prompt, args.role, temperature, max_tokens, context_documents, args.stream)
-
-        if response:
-            if not args.stream:
-                formatted_response = format_response(response, args.width)
-                print(formatted_response)
-            save_last_interaction(prompt, response)
-            if args.save:
-                save_to_markdown(prompt, response, args.save if isinstance(args.save, str) else None)
-        else:
-            print("Failed to get a response from Claude.")
+    response = chat_with_claude(full_prompt, context_history, args.role, args.temp, args.max_tokens)
+    
+    context_history.append({"human": prompt, "assistant": response})
+    save_context_history(context_history)
 
 if __name__ == "__main__":
     main()
-
