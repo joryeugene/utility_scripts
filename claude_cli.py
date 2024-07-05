@@ -9,25 +9,38 @@ from sklearn.metrics.pairwise import cosine_similarity
 import glob
 import textwrap
 import sys
+import pickle
 
 model = SentenceTransformer('all-MiniLM-L6-v2')
-vector_store = {}  # Global vector store
+vector_store = {}
+
+CONFIG_PATH = os.path.expanduser('~/.claude_cli_config.json')
+VECTOR_STORE_PATH = os.path.expanduser('~/.claude_vector_store.pkl')
+LAST_INTERACTION_PATH = os.path.expanduser('~/.claude_last_interaction.json')
 
 def embed_text(text):
     return model.encode([text])[0]
+
+def load_vector_store():
+    if os.path.exists(VECTOR_STORE_PATH):
+        with open(VECTOR_STORE_PATH, 'rb') as f:
+            return pickle.load(f)
+    return {}
+
+def save_vector_store(vector_store):
+    with open(VECTOR_STORE_PATH, 'wb') as f:
+        pickle.dump(vector_store, f)
 
 def add_file_to_store(filepath):
     try:
         with open(filepath, 'r') as file:
             content = file.read()
         vector_store[filepath] = embed_text(content)
-        print(f"Indexed file: {filepath}")
-        print(f"Content preview: {content[:100]}...")
+        print(f"Indexed: {filepath}")
     except FileNotFoundError:
         print(f"Error: File not found: {filepath}")
 
 def retrieve_relevant_context(query, top_k=3):
-    global vector_store
     if not vector_store:
         print("Error: Vector store is empty. Please run --index first.")
         return []
@@ -35,26 +48,21 @@ def retrieve_relevant_context(query, top_k=3):
     similarities = {path: cosine_similarity([query_embedding], [emb])[0][0] for path, emb in vector_store.items()}
     sorted_paths = sorted(similarities.items(), key=lambda x: x[1], reverse=True)
     relevant_documents = []
-    print(f"Debug: All similarities: {similarities}")
     for path, similarity in sorted_paths[:top_k]:
-        print(f"Debug: Considering document {path} with similarity {similarity}")
         with open(path, 'r') as file:
             content = file.read()
-            relevant_documents.append((path, content[:1000]))  # Increased preview length
-        print(f"Debug: Document preview: {content[:100]}...")  # Print document preview
+            relevant_documents.append((path, content[:1000]))
     print(f"Retrieved {len(relevant_documents)} relevant documents.")
     return relevant_documents
 
 def load_config():
-    config_path = os.path.expanduser('~/.claude_cli_config.json')
-    if os.path.exists(config_path):
-        with open(config_path, 'r') as f:
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, 'r') as f:
             return json.load(f)
     return {'context_path': os.path.expanduser('~/scripts/claude_data'), 'roles': {}}
 
 def save_config(config):
-    config_path = os.path.expanduser('~/.claude_cli_config.json')
-    with open(config_path, 'w') as f:
+    with open(CONFIG_PATH, 'w') as f:
         json.dump(config, f, indent=2)
 
 def format_response(response, width=80):
@@ -79,7 +87,7 @@ def chat_with_claude(prompt, role=None, temperature=0.7, max_tokens=None, contex
     if role:
         system_prompt += f" You are acting as the assistant to a {role}."
 
-    context = "\n".join(f"Content from {path}:\n{preview}..." for path, preview in context_documents)
+    context = "\n".join(f"Content from {path}:\n{preview}" for path, preview in context_documents)
     full_prompt = f"""As an AI assistant, please consider the following context and user query:
 Context:
 {context}
@@ -134,18 +142,20 @@ def save_last_interaction(prompt, response, filename=None):
             save_to_markdown(prompt, response, filename)
     else:
         last_interaction = {'timestamp': datetime.now().isoformat(), 'prompt': prompt, 'response': response if isinstance(response, str) else response[0].text if isinstance(response, list) and len(response) > 0 else str(response)}
-        with open(os.path.expanduser('~/.claude_last_interaction.json'), 'w') as f:
+        with open(LAST_INTERACTION_PATH, 'w') as f:
             json.dump(last_interaction, f, indent=2)
-    print(f"Last interaction saved to {filename if filename else '~/.claude_last_interaction.json'}")
+    print(f"Last interaction saved to {filename if filename else LAST_INTERACTION_PATH}")
 
 def load_last_interaction():
     try:
-        with open(os.path.expanduser('~/.claude_last_interaction.json'), 'r') as f:
+        with open(LAST_INTERACTION_PATH, 'r') as f:
             return json.load(f)
     except FileNotFoundError:
         return None
 
 def main():
+    global vector_store
+    vector_store = load_vector_store()
     config = load_config()
 
     parser = argparse.ArgumentParser(description="Chat with Claude from the command line.")
@@ -166,23 +176,26 @@ def main():
     parser.add_argument("--query", help="Query to retrieve context for and send to Claude.")
     args = parser.parse_args()
 
-    global vector_store
-
     if args.clear_index:
         vector_store.clear()
+        save_vector_store(vector_store)
         print("Cleared indexed documents.")
+        return
 
     if args.set_context_path:
         config['context_path'] = os.path.expanduser(args.set_context_path)
         save_config(config)
         print(f"Context path set to: {config['context_path']}")
+        return
 
     if args.index:
         context_path = os.path.expanduser(config['context_path'])
         os.makedirs(context_path, exist_ok=True) 
         for filepath in glob.glob(os.path.join(context_path, '*')):
             add_file_to_store(filepath)
-        print(f"Indexed local files from: {context_path}")
+        save_vector_store(vector_store)
+        print(f"Indexed files from: {context_path}")
+        return
 
     if args.save_role:
         config['roles'] = config.get('roles', {})
@@ -223,20 +236,11 @@ def main():
             print(f"No saved configuration found for role: {args.use_role}")
             return
 
-    # print(f"Debug: Vector store after indexing: {vector_store}")  # Debug print
-
     prompt = args.query if args.query else " ".join(args.prompt) if args.prompt else input("Enter your prompt: ")
     
     if prompt:
         context_documents = retrieve_relevant_context(prompt)
-        # print(f"Context documents retrieved: {context_documents}")
-
-        if context_documents:
-            print("Debug: Full context:")
-            for path, content in context_documents:
-                print(f"Path: {path}")
-                print(f"Content: {content}\n")
-        else:
+        if not context_documents:
             print("Warning: No relevant context found. Responding without context.")
 
         max_tokens = int(args.max_tokens) if args.max_tokens is not None else 1000
