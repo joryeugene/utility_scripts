@@ -9,7 +9,7 @@ Claude CLI is a command-line interface for interacting with the Claude AI model 
 - Manage conversation history
 - Set custom roles for Claude
 - Adjust temperature and max tokens for responses
-- Stream Claude's responses in real-time
+- Stream Claude's responses in real-time (default behavior)
 
 ## Prerequisites
 

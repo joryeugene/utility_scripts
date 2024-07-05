@@ -82,7 +82,7 @@ def retrieve_relevant_context(query: str, vector_store: Dict[str, List[float]], 
     return relevant_documents
 
 def chat_with_claude(prompt: str, context_history: List[Dict[str, str]], role: Optional[str] = None,
-                     temperature: float = 0.7, max_tokens: Optional[int] = None) -> str:
+                     temperature: float = 0.7, max_tokens: Optional[int] = None, stream: bool = True) -> str:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY environment variable is not set")
@@ -92,21 +92,37 @@ def chat_with_claude(prompt: str, context_history: List[Dict[str, str]], role: O
     if role:
         system_prompt += f" You are acting as the assistant to a {role}."
 
-    messages = [{"role": "user", "content": prompt}]
+    messages = []
+    for entry in context_history:
+        messages.append({"role": "user", "content": entry["human"]})
+        messages.append({"role": "assistant", "content": entry["assistant"]})
+    messages.append({"role": "user", "content": prompt})
+
     try:
-        with client.messages.stream(
+        if stream:
+            response = ""
+            with client.messages.stream(
+                    model="claude-3-5-sonnet-20240620",
+                    max_tokens=max_tokens or 1000,
+                    temperature=temperature,
+                    system=system_prompt,
+                    messages=messages
+            ) as stream_response:
+                for text in stream_response.text_stream:
+                    print(text, end="", flush=True)
+                    response += text
+                print()
+        else:
+            response_obj = client.messages.create(
                 model="claude-3-5-sonnet-20240620",
                 max_tokens=max_tokens or 1000,
                 temperature=temperature,
                 system=system_prompt,
                 messages=messages
-        ) as stream:
-            full_response = ""
-            for text in stream.text_stream:
-                print(text, end="", flush=True)
-                full_response += text
-            print()
-        return full_response
+            )
+            response = response_obj["content"]
+            print(response)
+        return response
     except anthropic.APIError as e:
         print(f"An error occurred while communicating with the Claude API: {e}")
         return str(e)
